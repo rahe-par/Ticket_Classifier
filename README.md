@@ -36,6 +36,3 @@ Generation: The prompt instructs Gemini to act as a support assistant and genera
 The fine-tuned DistilBERT model achieved a final Test Accuracy of 55.82%.
 
 This project is for educational purposes as part of the GUVI Artificial Intelligence and Machine Learning program.
-Generated Reply (from Gemini): "Hello, Thank you for reaching out to us. We're sorry to hear you're having trouble accessing your course materials. We've received your ticket and have forwarded it to our education support team who will be able to assist you with this. Someone will be in touch with you shortly. Thank you for your patience."
-
-ure more nuances in the text, potentially improving differentiation between overlapping classes, albeit at a higher computational cost.
