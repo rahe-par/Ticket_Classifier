@@ -33,6 +33,6 @@ Generation: The prompt instructs Gemini to act as a support assistant and genera
 
 # Results and Evaluation
 
-The fine-tuned DistilBERT model achieved a final Test Accuracy of 55.82%.
+The fine-tuned XLM-RoBERTa base model achieved a final Test Accuracy of 0.6891%.
 
 This project is for educational purposes as part of the GUVI Artificial Intelligence and Machine Learning program.
