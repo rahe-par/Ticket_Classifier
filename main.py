@@ -1,179 +1,157 @@
-!pip install datasets tensorflow scikit-learn pandas numpy google-generativeai matplotlib seaborn transformers
+!pip install transformers datasets evaluate accelerate -q
 
-# STEP 1: IMPORT LIBRARIES
-
-import os
-import re
 import pandas as pd
 import numpy as np
-import tensorflow as tf
-from sklearn.model_selection import train_test_split
+import re
+import torch
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-from sklearn.utils import class_weight
-import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.model_selection import train_test_split
 from datasets import load_dataset
-import google.generativeai as genai
-from transformers import DistilBertTokenizer, TFDistilBertForSequenceClassification, create_optimizer
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding,
+)
+import evaluate
 
-# STEP 2: LOAD AND PREPARE THE DATASET
+# 1. LOAD DATASET
+print("Loading multilingual customer support tickets dataset...")
+dataset = load_dataset("Tobi-Bueck/customer-support-tickets")
+df = pd.DataFrame(dataset["train"])
 
-print("Loading dataset from Hugging Face...")
-try:
-    ds = load_dataset("Tobi-Bueck/customer-support-tickets")
-    df = pd.DataFrame(ds['train'])
-    print("Dataset loaded successfully.")
-except Exception as e:
-    print(f"Failed to load dataset. Error: {e}")
-    df = pd.DataFrame(data)
+# Use relevant text fields only
+df = df[['subject', 'body', 'queue']].dropna(subset=['body', 'queue'])
+df['subject'] = df['subject'].fillna('')
+df['body'] = df['body'].fillna('')
 
-print("\n--- Original Data Sample ---")
-print(df.head())
-
-df = df[['subject', 'body', 'queue']]
-df.dropna(subset=['body', 'queue'], inplace=True) # Only drop if body or queue is missing
-df['subject'].fillna('', inplace=True) # Fill missing subjects with an empty string
-
-# Basic text cleaning function
+# 2. CLEAN TEXT
 def clean_text(text):
-    if not isinstance(text, str):
-        return ""
     text = text.lower()
-    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE) # Remove URLs
-    text = re.sub(r'\s+', ' ', text).strip() # Remove extra whitespace
+    text = re.sub(r"http\S+|www\S+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
-df['subject'] = df['subject'].apply(clean_text)
-df['body'] = df['body'].apply(clean_text)
+df["subject"] = df["subject"].apply(clean_text)
+df["body"] = df["body"].apply(clean_text)
+df["text"] = df["subject"] + " [SEP] " + df["body"]
 
-# COMBINE SUBJECT AND BODY
-print("\nCombining 'subject' and 'body' fields for more context...")
-df['combined_text'] = df['subject'] + ' [SEP] ' + df['body']
-
-df = df.sample(frac=1, random_state=42).reset_index(drop=True) # Shuffle the dataset
-
-# STEP 3: LABEL ENCODING
-
-print("\nEncoding target labels...")
+# 3. ENCODE LABELS
 label_encoder = LabelEncoder()
-df['queue_encoded'] = label_encoder.fit_transform(df['queue'])
-num_classes = len(label_encoder.classes_)
-print(f"Found {num_classes} unique classes.")
+df["label"] = label_encoder.fit_transform(df["queue"])
+num_labels = len(label_encoder.classes_)
+print(f"Detected {num_labels} label classes")
 
-# Create mappings for later use
-id_to_label = {i: label for i, label in enumerate(label_encoder.classes_)}
-label_to_id = {label: i for i, label in enumerate(label_encoder.classes_)}
-
-# STEP 4: SPLIT DATA
-
-print("\nSplitting data into training and testing sets...")
-X_train, X_test, y_train, y_test = train_test_split(
-    df['combined_text'], # Use the new combined field
-    df['queue_encoded'],
+# 4. SPLIT DATA
+train_texts, test_texts, train_labels, test_labels = train_test_split(
+    df["text"].tolist(),
+    df["label"].tolist(),
     test_size=0.2,
     random_state=42,
-    stratify=df['queue_encoded']
+    stratify=df["label"]
 )
-print(f"Training set size: {len(X_train)}")
-print(f"Testing set size: {len(X_test)}")
 
-# STEP 5: TOKENIZATION WITH A TRANSFORMER-SPECIFIC TOKENIZER
+# 5. TOKENIZATION
+MODEL_NAME = "xlm-roberta-base"  # multilingual backbone
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-print("\nTokenizing text for DistilBERT...")
-MODEL_NAME = 'distilbert-base-uncased'
-tokenizer = DistilBertTokenizer.from_pretrained(MODEL_NAME)
+train_encodings = tokenizer(train_texts, truncation=True, padding=True, max_length=256)
+test_encodings = tokenizer(test_texts, truncation=True, padding=True, max_length=256)
 
-MAX_LEN = 170 
+train_dataset = {
+    "input_ids": train_encodings["input_ids"],
+    "attention_mask": train_encodings["attention_mask"],
+    "labels": train_labels
+}
+test_dataset = {
+    "input_ids": test_encodings["input_ids"],
+    "attention_mask": test_encodings["attention_mask"],
+    "labels": test_labels
+}
 
-# Tokenize the training and test sets
-train_encodings = tokenizer(X_train.tolist(), truncation=True, padding=True, max_length=MAX_LEN)
-test_encodings = tokenizer(X_test.tolist(), truncation=True, padding=True, max_length=MAX_LEN)
+import torch
+class TicketDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings):
+        self.encodings = encodings
+    def __getitem__(self, idx):
+        return {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+    def __len__(self):
+        return len(self.encodings["labels"])
 
-# STEP 6: CREATE TENSORFLOW DATASETS
+train_ds = TicketDataset(train_dataset)
+test_ds = TicketDataset(test_dataset)
 
-print("\nCreating TensorFlow datasets for efficient training...")
-train_dataset = tf.data.Dataset.from_tensor_slices((
-    dict(train_encodings),
-    y_train.tolist()
-))
-test_dataset = tf.data.Dataset.from_tensor_slices((
-    dict(test_encodings),
-    y_test.tolist()
-))
+# 6. METRICS
+accuracy_metric = evaluate.load("accuracy")
+f1_metric = evaluate.load("f1")
 
-# STEP 7: LOAD AND COMPILE THE TRANSFORMER MODEL
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    acc = accuracy_metric.compute(predictions=preds, references=labels)
+    f1 = f1_metric.compute(predictions=preds, references=labels, average="weighted")
+    return {**acc, **f1}
 
-print(f"\nLoading pre-trained model: {MODEL_NAME}...")
-model = TFDistilBertForSequenceClassification.from_pretrained(
+# 7. MODEL
+model = AutoModelForSequenceClassification.from_pretrained(
     MODEL_NAME,
-    num_labels=num_classes,
-    id2label=id_to_label,
-    label2id=label_to_id,
-    from_pt=True # Explicitly load from a PyTorch checkpoint
+    num_labels=num_labels
 )
 
-# STEP 8: CREATE OPTIMIZER WITH LEARNING RATE SCHEDULER
-
-print("\nCreating optimizer with a learning rate scheduler...")
-EPOCHS = 8 
-BATCH_SIZE = 16 
-
-# The number of training steps is the number of samples in the dataset, divided by the batch size then multiplied by the total number of epochs.
-num_train_steps = (len(X_train) // BATCH_SIZE) * EPOCHS
-num_warmup_steps = int(0.1 * num_train_steps) # 10% of steps for warmup
-
-# Create a learning rate scheduler with warmup and decay
-optimizer, _ = create_optimizer(
-    init_lr=5e-5,
-    num_train_steps=num_train_steps,
-    num_warmup_steps=num_warmup_steps
+training_args = TrainingArguments(
+    output_dir="./results",
+    eval_strategy="epoch",      
+    save_strategy="epoch",
+    learning_rate=2e-5,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
+    num_train_epochs=6,
+    weight_decay=0.02,
+    warmup_ratio=0.1,
+    load_best_model_at_end=True,
+    metric_for_best_model="f1",
+    logging_dir="./logs",
+    save_total_limit=2,
+    fp16=torch.cuda.is_available()
 )
 
-# Compile the model with the new optimizer
-loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-metrics = ['accuracy']
-model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
-model.summary()
-
-# STEP 9: FINE-TUNE THE MODEL
-
-print("\nFine-tuning the model...")
-
-# Calculate class weights to handle imbalance
-class_weights = class_weight.compute_class_weight(
-    'balanced',
-    classes=np.unique(y_train),
-    y=y_train
+# 9. TRAINER
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=test_ds,
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics,
+    data_collator=DataCollatorWithPadding(tokenizer)
 )
-class_weights_dict = dict(enumerate(class_weights))
 
-history = model.fit(
-    train_dataset.shuffle(1000).batch(BATCH_SIZE),
-    epochs=EPOCHS,
-    batch_size=BATCH_SIZE,
-    validation_data=test_dataset.batch(BATCH_SIZE),
-    class_weight=class_weights_dict
-)
-print("\nModel fine-tuning finished.")
+# 10. TRAIN MODEL
+trainer.train()
 
-# STEP 10: SAVE THE FINE-TUNED MODEL AND TOKENIZER
+# 11. EVALUATE
+metrics = trainer.evaluate()
+print("Final Evaluation:", metrics)
 
-print("\nSaving the fine-tuned model and tokenizer for future use...")
-save_directory = "./fine_tuned_ticket_classifier"
-model.save_pretrained(save_directory)
-tokenizer.save_pretrained(save_directory)
-print(f"Model and tokenizer have been saved to the directory: '{save_directory}'")
+# Save model for future inference
+model.save_pretrained("xlm_roberta_tickets_90plus")
+tokenizer.save_pretrained("xlm_roberta_tickets_90plus")
 
-# STEP 11: EVALUATE THE MODEL
+import numpy as np
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 print("\nEvaluating the fine-tuned model...")
-# Predict on the test set
-logits = model.predict(test_dataset.batch(BATCH_SIZE)).logits
-y_pred_classes = np.argmax(logits, axis=1)
-y_test_classes = y_test.to_numpy()
 
-# Calculate and print metrics
+# Step 1: Predict on test set using Hugging Face Trainer
+test_preds_output = trainer.predict(test_ds)
+logits = test_preds_output.predictions
+y_pred_classes = np.argmax(logits, axis=1)
+y_test_classes = np.array(test_labels)
+
+# Step 2: Calculate and print metrics
 accuracy = accuracy_score(y_test_classes, y_pred_classes)
 print(f"\nTest Accuracy: {accuracy:.4f}")
 
@@ -183,73 +161,71 @@ print(classification_report(y_test_classes, y_pred_classes, target_names=label_e
 print("\n--- Confusion Matrix ---")
 cm = confusion_matrix(y_test_classes, y_pred_classes)
 plt.figure(figsize=(14, 12))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_)
-plt.title('Confusion Matrix (Transformer Model)')
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=label_encoder.classes_,
+            yticklabels=label_encoder.classes_)
+plt.title('Confusion Matrix (Multilingual Transformer)')
 plt.xlabel('Predicted Label')
 plt.ylabel('True Label')
 plt.show()
 
-# STEP 11: GEMINI API INTEGRATION (DEMONSTRATION)
+!pip install -q -U google-genai
 
+from google import genai
+
+# --- Gemini API integration ---
+import os
 print("\nSetting up Gemini API for response generation...")
 try:
-    from google.colab import userdata
-    GEMINI_API_KEY = userdata.get('GEMINI_API_KEY')
-    genai.configure(api_key=GEMINI_API_KEY)
-except (ImportError, KeyError):
-    print("Could not find GEMINI_API_KEY in Colab secrets. Please paste your API key here.")
-    try:
-        GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-        if not GEMINI_API_KEY:
-             GEMINI_API_KEY = input("Paste your Gemini API key and press Enter: ")
-        genai.configure(api_key=GEMINI_API_KEY)
-    except Exception as e:
-        print(f"Could not configure Gemini API: {e}")
-        GEMINI_API_KEY = None
-
-def generate_customer_reply(ticket_text, predicted_queue):
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     if not GEMINI_API_KEY:
-        return "Gemini API key not configured. Cannot generate response."
-    model_gen = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
+        GEMINI_API_KEY = input("Paste your Gemini API key: ").strip()
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+except Exception as e:
+    print(f"Could not configure Gemini API: {e}")
+    client = None
+def generate_customer_reply(ticket_text, predicted_queue):
+    if client is None:
+        return "Gemini API not configured; skipping response generation."
     prompt = f"""
-    You are a helpful and empathetic customer support assistant.
-    A customer has submitted a support ticket which our system has classified into the "{predicted_queue}" queue.
-    The customer's message is: "{ticket_text}"
-    Your task is to draft a polite, generic, and reassuring initial response to the customer.
-    The response should:
-    1. Acknowledge their issue without promising a specific solution yet.
-    2. Confirm that their ticket has been received and routed to the correct team.
-    3. Reassure them that someone will get back to them soon.
-    4. Maintain a professional and friendly tone.
-    Generate the response now.
+    You are a helpful, empathetic customer support assistant.
+    A customer has submitted a ticket categorized as "{predicted_queue}".
+    Message: "{ticket_text}"
+    Write a brief, professional, warm acknowledgment note confirming receipt.
     """
     try:
-        response = model_gen.generate_content(prompt)
+        response = client.models.generate_content(
+            model="models/gemini-2.5-flash",
+            contents=prompt
+        )
         return response.text
     except Exception as e:
-        return f"An error occurred while generating the response: {e}"
+        return f"Error generating Gemini response: {e}"
+
 
 print("\n--- Demonstrating Full Pipeline: Classify and Reply ---")
 # Select a random sample from the original test data
-sample_text = X_test.sample(1).iloc[0]
+sample_idx = np.random.choice(len(test_texts))
+sample_text = test_texts[sample_idx]
 
-# Tokenize the single sample
-predict_input = tokenizer.encode(
-    sample_text,
-    truncation=True,
-    padding=True,
-    return_tensors="tf"
-)
+# Tokenize and predict (PyTorch path)
+predict_input = tokenizer(sample_text, truncation=True, padding=True, return_tensors="pt")
 
-# Predict
-output = model(predict_input)[0]
-prediction_value = tf.argmax(output, axis=1).numpy()[0]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+predict_input = tokenizer(sample_text, truncation=True, padding=True, return_tensors="pt").to(device)
+with torch.no_grad():
+    output = model(**predict_input).logits
+with torch.no_grad():
+    output = model(**predict_input).logits
+prediction_value = np.argmax(output.cpu().numpy())
 predicted_queue = label_encoder.inverse_transform([prediction_value])[0]
 
-# Generate reply
-# We need to find the original ticket text for the sample to pass to Gemini
-original_subject = df[df['combined_text'] == sample_text]['subject'].values[0]
-original_body = df[df['combined_text'] == sample_text]['body'].values[0]
+# Find original subject/body for Gemini
+original_subject = df[df['text'] == sample_text]['subject'].values[0]
+original_body = df[df['text'] == sample_text]['body'].values[0]
 gemini_input_text = f"Subject: {original_subject}\n\nBody: {original_body}"
 
 generated_reply = generate_customer_reply(gemini_input_text, predicted_queue)
